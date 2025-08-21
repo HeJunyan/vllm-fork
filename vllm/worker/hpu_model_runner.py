@@ -2864,6 +2864,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         num_iters=3,
                         align_worker=False,
                         is_dummy_run=False) -> None:
+        return
         phase = 'prompt' if is_prompt else 'decode'
         use_graphs = is_dummy_run or self._use_graphs()
 
@@ -3159,6 +3160,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
     @torch.inference_mode()
     def warmup_model(self, kv_caches: List[torch.Tensor]) -> None:
+        return
+
         prompt_buckets = len(self.bucketing_manager.prompt_buckets)
         if not self.is_pooler:
             decode_buckets = len(self.bucketing_manager.decode_buckets)

@@ -291,6 +291,7 @@ class DistributedExecutorBase(ExecutorBase):
         execute_model_req: ExecuteModelRequest,
     ) -> Optional[List[SamplerOutput]]:
         # TODO: unify into collective_rpc
+#        print ("$$$$$$$$$$$$$$$$$$$$$$$$$$$ execute_model, execute_model_req is : ", execute_model_req)
         if self.parallel_worker_tasks is None:
             self.parallel_worker_tasks = self._run_workers(
                 "start_worker_execution_loop",

@@ -429,6 +429,16 @@ class Glm4MoeModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if torch.distributed.get_rank() == 0:
+            if input_ids is not None:
+                print ("11111111111111111 model forward, input_ids shape is : ", input_ids.shape)
+            if positions is not None:
+                print ("11111111111111111 positions shape is : ", positions.shape)
+            if intermediate_tensors is not None:
+                print ("11111111111111111  intermediate_tensors is : ", intermediate_tensors.tensors)
+            if inputs_embeds is not None:
+                print ("11111111111111111  inputs_embeds shape is : ", inputs_embeds.shape)
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
