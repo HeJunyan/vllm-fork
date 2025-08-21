@@ -37,7 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import BatchFeature
-from transformers.models.glm4v.configuration_glm4v import Glm4vConfig
+from transformers.models.glm4v.configuration_glm4v import Glm4vVisionConfig
 from transformers.models.glm4v.image_processing_glm4v import (
     Glm4vImageProcessor, smart_resize)
 from transformers.models.glm4v.video_processing_glm4v import (
@@ -184,7 +184,7 @@ class Glm4vVisionMLP(nn.Module):
             output_sizes=[hidden_features] * 2,
             bias=bias,
             quant_config=quant_config,
-        )
+            prefix=f"{prefix}.gate_up_proj")
         self.down_proj = RowParallelLinear(hidden_features,
                                            in_features,
                                            bias=bias,
@@ -466,6 +466,7 @@ class Glm4vPatchMerger(nn.Module):
         context_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
@@ -488,7 +489,7 @@ class Glm4vPatchMerger(nn.Module):
             self.hidden_size,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
         self.extra_activation_func = nn.GELU()
@@ -678,6 +679,7 @@ class Glm4vVisionTransformer(nn.Module):
             context_dim=vision_config.intermediate_size,
             quant_config=quant_config,
             bias=False,
+            prefix=f"{prefix}.merger",
         )
         self.embeddings = Glm4vVisionEmbeddings(vision_config)
 
