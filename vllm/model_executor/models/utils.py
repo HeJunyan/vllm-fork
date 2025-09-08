@@ -535,6 +535,15 @@ def merge_multimodal_embeddings(
     Note:
         This updates ``inputs_embeds`` in place.
     """
+    if torch.distributed.get_rank() == 0:
+        torch.set_printoptions(edgeitems=150)
+        print ("PPPPPPPPPPPPPPPPP merge_multimodal_embeddings, input_ids is : ", input_ids)
+        torch.set_printoptions(edgeitems=150)
+        print ("PPPPPPPPPPPPPPPPP merge_multimodal_embeddings, placeholder_token_id is : ", placeholder_token_id)
+        print ("PPPPPPPPPPPPPPPPP merge_multimodal_embeddings, inputs_embeds is : ", inputs_embeds.shape)
+        print ("PPPPPPPPPPPPPPPPP merge_multimodal_embeddings, multimodal_embeddings is : ",
+            multimodal_embeddings[0].shape, " len is : ", len(multimodal_embeddings))
+
     if isinstance(placeholder_token_id, list):
         placeholder_token_id = torch.tensor(placeholder_token_id,
                                             device=input_ids.device)

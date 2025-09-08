@@ -1046,6 +1046,7 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
             "max_pixels": 1280 * 28 * 28,
             "fps": 1,
         },
+        tensor_parallel_size=2,
         limit_mm_per_prompt={modality: 1},
     )
 
@@ -1370,7 +1371,7 @@ def main(args):
     # We set temperature to 0.2 so that outputs can be different
     # even when all prompts are identical when running batch inference.
     sampling_params = SamplingParams(
-        temperature=0.2, max_tokens=64, stop_token_ids=req_data.stop_token_ids
+        temperature=0.2, max_tokens=1, stop_token_ids=req_data.stop_token_ids
     )
 
     assert args.num_prompts > 0

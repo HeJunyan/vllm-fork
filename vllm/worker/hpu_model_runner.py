@@ -667,6 +667,7 @@ class HpuModelAdapter(torch.nn.Module):
 
         input_ids = kwargs['input_ids']
         with compile_only_mode_context_false():
+            print ("UUUUUUUUUUUUUUUUUUser mrope")
             if self.model_is_mrope:
                 image_input = self.model._parse_and_validate_image_input(
                     **kwargs)

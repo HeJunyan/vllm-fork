@@ -81,6 +81,8 @@ if is_hpu:
     from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
 
+layer_nth=0
+
 class AttentionLongSequence:
 
     @staticmethod
@@ -110,13 +112,33 @@ class AttentionLongSequence:
 
 
 def create_block_diagonal_attention_mask_outerprod(indices):
+    if torch.distributed.get_rank() == 0:
+        print ("???????????? create_block_diagonal_attention_mask_outerprod  indices is : ", indices, " shape is : ", indices.shape)
     maxsize = indices[-1]
+    if torch.distributed.get_rank() == 0:
+        print ("????????????2 create_block_diagonal_attention_mask_outerprod maxsize is : ", maxsize)
     range_to_max_for_each_img = torch.arange(
         maxsize,
         device=indices.device).unsqueeze(0).repeat(indices.shape[0] - 1, 1)
+
+    if torch.distributed.get_rank() == 0:
+        print ("????????????3 create_block_diagonal_attention_mask_outerprod range_to_max_for_each_img is : ",
+            range_to_max_for_each_img, " shape is : ", range_to_max_for_each_img.shape)
     lesser = range_to_max_for_each_img < indices[1:].unsqueeze(1)
+
+    if torch.distributed.get_rank() == 0:
+        print ("????????????4 create_block_diagonal_attention_mask_outerprod lesser is : ",
+            lesser, " shape is : ", lesser.shape)
     greater_eq = range_to_max_for_each_img >= indices[:-1].unsqueeze(1)
+    if torch.distributed.get_rank() == 0:
+        print ("????????????5 create_block_diagonal_attention_mask_outerprod greater_eq is : ",
+            greater_eq, " shape is : ", greater_eq.shape)
     range_indices = torch.logical_and(lesser, greater_eq).float()
+
+    if torch.distributed.get_rank() == 0:
+        print ("????????????6 create_block_diagonal_attention_mask_outerprod range_indices is : ",
+            range_indices, " shape is : ", range_indices.shape)
+
     # can reduce sum externally or as batchmatmul
     if range_indices.shape[-1] > 40000:
         log_msg = "einsum running on CPU :" + str(range_indices.shape)
@@ -126,6 +148,9 @@ def create_block_diagonal_attention_mask_outerprod(indices):
         res = res.to("hpu")
     else:
         res = torch.einsum('bi,bj->ij', range_indices, range_indices)
+        if torch.distributed.get_rank() == 0:
+            print ("????????????6 create_block_diagonal_attention_mask_outerprod res is : ",
+                res, " shape is : ", res.shape)
     return res.bool()
 
 
@@ -228,6 +253,7 @@ class Qwen2_5_VisionMLP(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None,
                  prefix: str = ""):
         super().__init__()
+
         self.gate_proj = ColumnParallelLinear(in_features,
                                               hidden_features,
                                               bias=bias,
@@ -246,10 +272,26 @@ class Qwen2_5_VisionMLP(nn.Module):
         self.act_fn = act_fn
 
     def forward(self, x: torch.Tensor):
+        global layer_nth
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("QQQQQQQQQQQQQ  Qwen2_5_VisionMLP x is : ", x.shape)
+
         x_gate, _ = self.gate_proj(x)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("QQQQQQQQQQQQQ  222  Qwen2_5_VisionMLP x_gate is : ", x_gate.shape)
+
         x_gate = self.act_fn(x_gate)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("QQQQQQQQQQQQQ  333  Qwen2_5_VisionMLP x_gate is : ", x_gate.shape)
+
         x_up, _ = self.up_proj(x)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("QQQQQQQQQQQQQ  444  Qwen2_5_VisionMLP x_up is : ", x_up.shape)
+
         x_down, _ = self.down_proj(x_gate * x_up)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("QQQQQQQQQQQQQ  555  Qwen2_5_VisionMLP x_down is : ", x_down.shape)
+
         return x_down
 
 
@@ -257,6 +299,12 @@ def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
     """All-gather the input tensor interleavely across model parallel group."""
     import torch.distributed as dist
     gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(tp_size)]
+
+    global layer_nth
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("<<<<<<<<<<<<< all_gather_interleave, gathered_tensors shape is : ", gathered_tensors[0].shape,
+            "  hidden_size is : ", hidden_size)
+
     dist.all_gather(gathered_tensors,
                     local_tensor,
                     group=parallel_state.get_tp_group().device_group)
@@ -265,10 +313,21 @@ def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
         torch.split(tensor, hidden_size // tp_size, -1)
         for tensor in gathered_tensors
     ]
+
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("<<<<<<<<<<<<<111 all_gather_interleave, gathered_tensors_split shape is : ", gathered_tensors_split[0][0].shape,
+            " len is : ", len(gathered_tensors_split), " len dim 1 is : ", len(gathered_tensors_split[0]))
+
     ordered_tensors = [
         tensor for pair in zip(*gathered_tensors_split) for tensor in pair
     ]
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("<<<<<<<<<<<<<222 all_gather_interleave, ordered_tensors shape is : ", ordered_tensors[0].shape)
+
     result_tensor = torch.cat(ordered_tensors, dim=-1)
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("<<<<<<<<<<<<<333 all_gather_interleave, result_tensor shape is : ", result_tensor.shape)
+
     return result_tensor
 
 
@@ -286,6 +345,9 @@ class Qwen2_5_VisionAttention(nn.Module):
         # Per attention head and per partition values.
         self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        if torch.distributed.get_rank() == 0:
+          print ("^^^^^^^^^^^^^^ num_heads is : ", num_heads, " projection_size is : ", projection_size, " embed_dim is : ", embed_dim)
+
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads)
         self.num_attention_heads_per_partition = dist_utils.divide(
@@ -326,6 +388,9 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         # [s, b, 3 * head * head_dim] -> 3 * [s, b, head * head_dim]
         q, k, v = qkv.chunk(3, dim=2)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print (">>>>>>>> split_qkv, q shape is : ", q.shape, " k shape is : ", k.shape,
+                " v shape is : ", v.shape,)
 
         # 3 * [s, b, head * head_dim]
         if self.tp_size > 1:
@@ -334,11 +399,22 @@ class Qwen2_5_VisionAttention(nn.Module):
             q = splitter(q)[self.tp_rank]
             k = splitter(k)[self.tp_rank]
             v = splitter(v)[self.tp_rank]
+            if layer_nth == 1 and torch.distributed.get_rank() == 0:
+                print (">>>>>>>>222 split_qkv, after splitter q shape is : ", q.shape, " k shape is : ", k.shape,
+                    " v shape is : ", v.shape,)
+
 
         # 3 * [s, b, head * head_dim] -> 3 * [s, b, head, head_dim]
         new_shape = (seq_len, bs, self.num_attention_heads_per_partition,
                      self.hidden_size_per_attention_head)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print (">>>>>>>>333 new_shape shape is : ", new_shape)
+
         q, k, v = (x.view(*new_shape) for x in (q, k, v))
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print (">>>>>>>>5555 split_qkv, return q shape is : ", q.shape, " k shape is : ", k.shape,
+                " v shape is : ", v.shape)
+
         return q, k, v
 
     def forward(
@@ -350,7 +426,13 @@ class Qwen2_5_VisionAttention(nn.Module):
             seqlens: Optional[list[int]] = None,  # Only used for xFormers
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
+        global layer_nth
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("<<<<<<<<<<<<<<<<<<<<<<<<< forward, x shape is : ", x.shape)
         x, _ = self.qkv(x)
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("<<<<<<<<<<<<<<<<<<<<<<<<< 222 forward, x shape after qkv is : ", x.shape)
+#            print ("<<<<<<<<<<<<<<<<<<<<<<<<< 222 forward, x is : ", x)
 
         # [s, b, 3 * head * head_dim] -> 3 * [s, b, head, head_dim]
         q, k, v = self.split_qkv(x)
@@ -358,6 +440,10 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
                    for x in (q, k, v))
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("<<<<<<<<<<<<<<<<<<<<<<<<< 3333 forward, q shape after rearrange is : ", q.shape,
+                "  k shape is : ", k.shape, "  v shape is : ", v.shape)
+
         if rotary_pos_emb is not None:
             q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
             k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
@@ -387,6 +473,9 @@ class Qwen2_5_VisionAttention(nn.Module):
             # to represent the mask for full attention,
             # if the mask is None we are doing window attention
             fullattn_mask = cu_seqlens
+
+            if layer_nth == 1 and torch.distributed.get_rank() == 0:
+                print ("<<<<<<<<<<<<<<<<<<<<<<<<< 555 forward, fullattn_mask is : ", fullattn_mask)
 
             if fullattn_mask is None:  # performs window attention
                 # we assume image is 112 aligned in both h/w dims
@@ -432,6 +521,10 @@ class Qwen2_5_VisionAttention(nn.Module):
                     fused_out = AttentionLongSequence.forward(
                         q1, k1, v1, attn_mask, 64, self.softmax_mode)
                 context_layer = rearrange(fused_out, "b h s d -> b s h d ")
+
+            if layer_nth == 1 and torch.distributed.get_rank() == 0:
+                print ("<<<<<<<<<<<<<<<<<<<<<<<<< 666 forward, context_layer is : ", context_layer.shape)
+
         elif self.attn_backend == _Backend.TORCH_SDPA:
             # Execute attention entry by entry for speed & less VRAM.
             outputs = []
@@ -463,7 +556,14 @@ class Qwen2_5_VisionAttention(nn.Module):
         context_layer = rearrange(context_layer,
                                   "b s h d -> s b (h d)").contiguous()
 
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("<<<<<<<<<<<<<<<<<<<<<<<<< 777 forward, context_layer is : ", context_layer.shape)
+
         output, _ = self.proj(context_layer)
+
+        if layer_nth == 1 and torch.distributed.get_rank() == 0:
+            print ("<<<<<<<<<<<<<<<<<<<<<<<<< 888 forward, output is : ", output.shape)
+
         return output
 
 
@@ -504,6 +604,9 @@ class Qwen2_5_VisionBlock(nn.Module):
             max_seqlen: Optional[int] = None,  # Only used for Flash Attention
             seqlens: Optional[list[int]] = None,  # Only used for xFormers
     ) -> torch.Tensor:
+        global layer_nth
+        layer_nth += 1
+
         x = x + self.attn(self.norm1(x),
                           cu_seqlens=cu_seqlens,
                           rotary_pos_emb=rotary_pos_emb,
@@ -537,9 +640,18 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         L, C = x.shape
+        if torch.distributed.get_rank() == 0:
+            print ("{{{{{{{{{{{{{{{{{ x.shape is : ", x.shape)
+            print ("{{{{{{{{{{{{{{{{{111 self.temporal_patch_size is : ", self.temporal_patch_size,
+                " self.patch_size is : ",self.patch_size)
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size,
                    self.patch_size)
+        if torch.distributed.get_rank() == 0:
+            print ("{{{{{{{{{{{{{{{{{2222 x.shape is : ", x.shape)
         x = self.proj(x).view(L, self.hidden_size)
+
+        if torch.distributed.get_rank() == 0:
+            print ("{{{{{{{{{{{{{{{{{333 x.shape is : ", x.shape)
         return x
 
 
@@ -575,12 +687,29 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.ln_q(x)
+
+        if torch.distributed.get_rank() == 0:
+            print ("ggggggggggggggggggg Qwen2_5_VisionPatchMerger, after ln_q, x is : ", x.shape)
+
         x = x.view(-1, self.hidden_size)
 
+        if torch.distributed.get_rank() == 0:
+            print ("ggggggggggggggggggg 222 Qwen2_5_VisionPatchMerger, after view, x is : ", x.shape)
+
         mlp_fc1, mlp_act, mlp_fc2 = self.mlp
+
         x_parallel, _ = mlp_fc1(x)
+        if torch.distributed.get_rank() == 0:
+            print ("ggggggggggggggggggg 333 Qwen2_5_VisionPatchMerger, after mlp_fc1, x_parallel is : ", x_parallel.shape)
+
         x_parallel = mlp_act(x_parallel)
+        if torch.distributed.get_rank() == 0:
+            print ("ggggggggggggggggggg 444 Qwen2_5_VisionPatchMerger, after mlp_act, x_parallel is : ", x_parallel.shape)
+
         out, _ = mlp_fc2(x_parallel)
+        if torch.distributed.get_rank() == 0:
+            print ("ggggggggggggggggggg 555 Qwen2_5_VisionPatchMerger, after mlp_fc2, out is : ", out.shape)
+
         return out
 
 
@@ -600,12 +729,21 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         if seqlen > self._seq_len_cached:
             seqlen *= 2
             self._seq_len_cached = seqlen
+
+            if torch.distributed.get_rank() == 0:
+                print ("^^^^^^^^^^^^^^^^ update_freqs_cache, self.dim is : ", self.dim)
             self.inv_freq = 1.0 / (self.theta**(torch.arange(
                 0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device)
                                                 / self.dim))
+            if torch.distributed.get_rank() == 0:
+                print ("^^^^^^^^^^^^^^^^ 11111 update_freqs_cache, self.inv_freq is : ", self.inv_freq.shape)
             seq = torch.arange(seqlen,
                                device=self.inv_freq.device,
                                dtype=self.inv_freq.dtype)
+
+            if torch.distributed.get_rank() == 0:
+                print ("^^^^^^^^^^^^^^^^ 22222 update_freqs_cache, seq is : ", seq.shape)
+
             freqs = torch.outer(seq, self.inv_freq)
             self._freqs_cached = freqs
 
@@ -680,28 +818,58 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        if torch.distributed.get_rank() == 0:
+            torch.set_printoptions(edgeitems=15)
+            print (";;;;;;;;;;;;;;; rot_pos_emb, grid_thw is : ", grid_thw, "  shape is : ", grid_thw.shape)
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            #print (";;;;;;;;;;;;;;;111 rot_pos_emb, hpos_ids is : ", hpos_ids, " shape is : ", hpos_ids.shape)
             wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            #print (";;;;;;;;;;;;;;;222 rot_pos_emb, wpos_ids is : ", wpos_ids, " shape is : ", wpos_ids.shape)
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             ).permute(0, 2, 1, 3).flatten()
+            #print (";;;;;;;;;;;;;;;333 rot_pos_emb, hpos_ids is : ", hpos_ids, " shape is : ", hpos_ids.shape)
+
             wpos_ids = wpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             ).permute(0, 2, 1, 3).flatten()
+            #print (";;;;;;;;;;;;;;;444 rot_pos_emb, wpos_ids is : ", wpos_ids, " shape is : ", wpos_ids.shape)
+
+            if torch.distributed.get_rank() == 0:
+                print (";;;;;;;;;;;;;;;444 222 rot_pos_emb, torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1) is : ", torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1).shape)
+
             pos_ids.append(
                 torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
+
+        if torch.distributed.get_rank() == 0:
+            print (";;;;;;;;;;;;;;;555 rot_pos_emb, pos_ids is : ", pos_ids.shape)
+            print (";;;;;;;;;;;;;;;555 000  rot_pos_emb, grid_thw[:, 1:] is : ", grid_thw[:, 1:])
+
         max_grid_size = grid_thw[:, 1:].max()
+
+        if torch.distributed.get_rank() == 0:
+            print (";;;;;;;;;;;;;;;666  rot_pos_emb, max_grid_size is : ", max_grid_size)
+
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+
+        if torch.distributed.get_rank() == 0:
+            print (";;;;;;;;;;;;;;;777 rot_pos_emb, rotary_pos_emb_full is : ", rotary_pos_emb_full.shape)
+
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+
+        if torch.distributed.get_rank() == 0:        
+#            print (";;;;;;;;;;;;;;;88888 000  rot_pos_emb, rotary_pos_emb_full[pos_ids].shape is : ", rotary_pos_emb_full[pos_ids].shape)
+            print (";;;;;;;;;;;;;;;88888 rot_pos_emb, rotary_pos_emb is : ", rotary_pos_emb.shape)
+
         return rotary_pos_emb
 
     def rotary_pos_emb_thw(self, t, h, w):
@@ -736,6 +904,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
         vit_merger_window_size = (self.window_size //
                                   self.spatial_merge_size // self.patch_size)
 
+        if torch.distributed.get_rank() == 0:
+            print ("|||||||||||||||||||| grid_thw is :", grid_thw)
+
         for grid_t, grid_h, grid_w in grid_thw:
             llm_grid_h = grid_h // self.spatial_merge_size
             llm_grid_w = grid_w // self.spatial_merge_size
@@ -747,23 +918,73 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 vit_merger_window_size - llm_grid_w % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+
+            if torch.distributed.get_rank() == 0:
+                print ("|||||||||||||||||||| 1111 llm_grid_h is : ", llm_grid_h, " llm_grid_w is : ",
+                    llm_grid_w, "  vit_merger_window_size is : ", vit_merger_window_size,
+                    " pad_h is : ", pad_h, "  pad_w is : ", pad_w, " num_windows_h is : ", num_windows_h,
+                    " num_windows_w is : ", num_windows_w)
+                print ("||||||||||||||||||||222 index is : ", index.shape)
+
             index_padded = F.pad(index, (0, pad_w, 0, pad_h), 'constant', -100)
+            if torch.distributed.get_rank() == 0:
+#                print ("||||||||||||||||||||3333 index_padded is : ", index_padded)
+                print ("||||||||||||||||||||3333 222222 index_padded shape is : ", index_padded.shape)
+
             index_padded = index_padded.reshape(grid_t, num_windows_h,
                                                 vit_merger_window_size,
                                                 num_windows_w,
                                                 vit_merger_window_size)
+            if torch.distributed.get_rank() == 0:                                                
+                print ("||||||||||||||||||||3333 ---333  index_padded reshape is : ", index_padded.shape)
+                print ("||||||||||||||||||||3333 ---444  index_padded.permute(0, 1, 3, 2, 4) shape is : ", index_padded.permute(0, 1, 3, 2, 4).shape)
+
             index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
                 grid_t, num_windows_h * num_windows_w, vit_merger_window_size,
                 vit_merger_window_size)
+
+            if torch.distributed.get_rank() == 0:
+                print ("||||||||||||||||||||3333 ---5555  index_padded permute and reshape is : ", index_padded.shape)
+
             seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+            if torch.distributed.get_rank() == 0:
+#                print ("||||||||||||||||||||3333 ---66666  index_padded (index_padded != -100) is : ", (index_padded != -100))
+#                print ("||||||||||||||||||||3333 ---66666--222  index_padded (index_padded != -100).sum([2, 3]) is : ", (index_padded != -100).sum([2, 3]))
+                print ("||||||||||||||||||||3333 ---666--333  seqlens : ", seqlens, "  shape is : ", seqlens.shape)
+
             index_padded = index_padded.reshape(-1)
+
+            if torch.distributed.get_rank() == 0:
+                print ("||||||||||||||||||||3333 ---77777  index_padded is : ", index_padded, " shape is : ", index_padded.shape)
+
             index_new = index_padded[index_padded != -100]
+
+            if torch.distributed.get_rank() == 0:
+                print ("||||||||||||||||||||3333 ---88888  index_new is : ", index_new, " shape is : ", index_new.shape)
             window_index.append(index_new + window_index_id)
+
+            if torch.distributed.get_rank() == 0:
+                print ("||||||||||||||||||||444 ---88888  window_index is : ", window_index[-1])
+
             cu_seqlens_tmp = seqlens.cumsum(
                 0) * self.spatial_merge_unit + cu_window_seqlens[-1]
+
+            if torch.distributed.get_rank() == 0:
+                print ("||||||||||||||||||||5 seqlens.cumsum(0) is : ", seqlens.cumsum(0), " shape is : ", seqlens.cumsum(0).shape)
+                print ("||||||||||||||||||||5  -- 1 cu_seqlens_tmp is : ", cu_seqlens_tmp)
+
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
+
+            if torch.distributed.get_rank() == 0:
+                print ("||||||||||||||||||||5 -- 2 cu_window_seqlens is : ", cu_window_seqlens)
+
             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
+
         window_index = torch.cat(window_index, dim=0)
+        if torch.distributed.get_rank() == 0:
+            print ("|||||||||||||||||||| 7 final window_index is : ", window_index, " shape is : ", window_index.shape)
+            print ("|||||||||||||||||||| 8 final cu_window_seqlens is : ", cu_window_seqlens, " size is : ", len(cu_window_seqlens))
+
         return window_index, cu_window_seqlens
 
     def get_window_index_thw(self, grid_t, grid_h, grid_w):
@@ -963,6 +1184,9 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
 
         desired_number_of_pixels = vision_buckets.get_multimodal_bucket(
             pixel_values.shape[0])
+        if torch.distributed.get_rank() == 0:
+            print ("oooooooooooooooooooo desired_number_of_pixels is : ", desired_number_of_pixels)
+
         padding_len = desired_number_of_pixels - pixel_values.shape[0]
         if padding_len <= 0:
             return pixel_values, image_grid_thw
@@ -982,11 +1206,17 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
                        device=pixel_values.device) * constant_value
         ])
 
+        if torch.distributed.get_rank() == 0:
+            print ("oooooooooooooooooooo222 pixel_values is : ", pixel_values)
+
         image_grid_thw = torch.cat([
             image_grid_thw,
             torch.tensor([[1, 8, padding_len // 8]],
                          device=image_grid_thw.device)
         ])
+
+        if torch.distributed.get_rank() == 0:
+            print ("oooooooooooooooooooo 333 image_grid_thw is : ", image_grid_thw)
 
         assert image_grid_thw.prod(-1).sum() == desired_number_of_pixels
         return pixel_values, image_grid_thw
@@ -994,7 +1224,14 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
     def pre_attn(self, x: torch.Tensor, grid_thw: torch.Tensor):
         # patchify
         hidden_states = x.to(device=self.device, dtype=self.dtype)
+
+        if torch.distributed.get_rank() == 0:
+            print ("!!!!!!!!!!!!!!!! hidden_states is :", hidden_states.shape)
+
         hidden_states = self.patch_embed(hidden_states)
+
+        if torch.distributed.get_rank() == 0:
+            print ("!!!!!!!!!!!!!!!!2 hidden_states is :", hidden_states.shape)
 
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
@@ -1008,6 +1245,10 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
             return [a[i] for i in range(len(a)) if i == 0 or a[i - 1] != a[i]]
 
         cu_window_seqlens = remove_duplicates_cpu(cu_window_seqlens)
+
+        if torch.distributed.get_rank() == 0:
+            print ("`````````````````  pre_attn cu_window_seqlens is : ", cu_window_seqlens, " size is : ", len(cu_window_seqlens))
+        
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=hidden_states.device,
@@ -1016,8 +1257,17 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+
+        if torch.distributed.get_rank() == 0:
+            print ("`````````````````111 pre_attn hidden_states is : ", hidden_states.shape)
         hidden_states = hidden_states[window_index, :, :]
+
+        if torch.distributed.get_rank() == 0:
+            print ("`````````````````222 pre_attn hidden_states is : ", hidden_states.shape)
         hidden_states = hidden_states.reshape(seq_len, -1)
+
+        if torch.distributed.get_rank() == 0:
+            print ("`````````````````333 pre_attn hidden_states is : ", hidden_states.shape)
         rotary_pos_emb = rotary_pos_emb.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
@@ -1025,7 +1275,13 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                              grid_thw[:, 0]).cumsum(
                                                  dim=0, dtype=torch.int32)
+        if torch.distributed.get_rank() == 0:
+            print ("`````````````````4 pre_attn cu_seqlens is : ", cu_seqlens)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+
+        if torch.distributed.get_rank() == 0:
+            print ("`````````````````5 pre_attn cu_seqlens is : ", cu_seqlens)
+
         return (
             hidden_states,
             rotary_pos_emb,
@@ -1040,6 +1296,11 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
                       "Please align before sending image and "
                       "check PR #1163 description for more details")
         assert x.shape[0] % 64 == 0, assert_msg
+
+        if torch.distributed.get_rank() == 0:
+            print ("FFFFFFFFFFFFFFFFForward, x is : ", x.shape, " fullattn_mask is : ",
+                fullattn_mask.shape, " rotary_pos_emb is : ", rotary_pos_emb.shape)
+
         hidden_states = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
             htcore.mark_step()
@@ -1047,13 +1308,30 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
                                 cu_seqlens=fullattn_mask if layer_num
                                 in self.fullatt_block_indexes else None,
                                 rotary_pos_emb=rotary_pos_emb)
+
+        if torch.distributed.get_rank() == 0:
+            print ("FFFFFFFFFFFFFFFFForward 222, hidden_states is : ", hidden_states.shape)
+
         return hidden_states
 
     def post_attn(self, hidden_states: torch.Tensor,
                   window_index: torch.Tensor):
         # adapter
+        if torch.distributed.get_rank() == 0:
+            torch.set_printoptions(edgeitems=150)
+            print ("HHHHHHHHHHHHHHHHH post_attn, input hidden_states is : ", hidden_states.shape)
+            print ("HHHHHHHHHHHHHHHHH post_attn, input window_index is : ", window_index)
+
         hidden_states = self.merger(hidden_states)
+
+        if torch.distributed.get_rank() == 0:
+            print ("HHHHHHHHHHHHHHHHH 222 post_attn, after merger hidden_states is : ", hidden_states.shape)
+
         reverse_indices = torch.argsort(window_index)
+
+        if torch.distributed.get_rank() == 0:
+            print ("HHHHHHHHHHHHHHHHH 333 post_attn, after argsort reverse_indices is : ", reverse_indices)
+            torch.set_printoptions(edgeitems=15)
 
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
@@ -1064,8 +1342,16 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
         grid_thw: torch.Tensor,
         vision_buckets,
     ) -> torch.Tensor:
+        if torch.distributed.get_rank() == 0:
+            print ("((((((((((((((((((((( 0 pixel_values is : ", pixel_values.shape)
+            print ("((((((((((((((((((((( 2 grid_thw is : ", grid_thw, "  shape is: ", grid_thw.shape)
+            print ("((((((((((((((((((((( 2--1 vision_buckets is : ", vision_buckets)
 
         num_patches = pixel_values.shape[0]
+
+        if torch.distributed.get_rank() == 0:
+            print ("((((((((((((((((((((( 3 num_patches is : ", num_patches)
+
         if num_patches % 64 != 0:
             assert num_patches > 64, "Image needs to be at least 112 x 112"
             logger_msg = (
@@ -1094,6 +1380,11 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
                 grid_thw[img_idx, 1] = hh_new
                 grid_thw[img_idx, 2] = ww_new
 
+            if torch.distributed.get_rank() == 0:
+                print ("((((((((((((((((((((( 4 grid_thw is : ", grid_thw)
+                print ("((((((((((((((((((((( 5 old_img_sizes is : ", old_img_sizes)
+                print ("((((((((((((((((((((( 6 new_img_sizes is : ", new_img_sizes)
+
             # truncate pixel_values to new shapes
             copy_pointer = 0
             paste_pointer = 0
@@ -1108,6 +1399,10 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
 
         offset = 0
         results = []
+
+        if torch.distributed.get_rank() == 0:
+            print ("((((((((((((((((((((( 7 pixel_values shape is : ", pixel_values.shape)
+
         # process each image one by one
         for img_idx in range(grid_thw.shape[0]):
             img_shape = grid_thw[img_idx, :].unsqueeze(0)
@@ -1142,11 +1437,20 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
             htcore.mark_step()
 
             image_embeds = self.post_attn(hidden_states, window_index)
+            if torch.distributed.get_rank() == 0:
+                print ("((((((((((((((((((((( 888 get_image_embeds, image_embeds is : ", image_embeds.shape)
+
             # slice image_embeds to remove the padded parts
             pad_index = img_shape_padded[0].prod() // self.spatial_merge_unit
             results += [image_embeds[:pad_index, :]]
+            if torch.distributed.get_rank() == 0:
+                print ("((((((((((((((((((((( 999 get_image_embeds, removed padding, results is : ", results[img_idx].shape)
+
         results_cat = torch.concat(results)
         image_embeds = results_cat
+        if torch.distributed.get_rank() == 0:
+            print ("((((((((((((((((((((( 1010 get_image_embeds, final image_embeds is : ", image_embeds.shape)
+
         return image_embeds
 
 
@@ -1176,7 +1480,7 @@ class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 size=size,
-                use_fast=kwargs.get("use_fast")),
+                use_fast=False),
             **kwargs,
         )
 
@@ -1272,14 +1576,33 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
 
+        if pixel_values is not None:
+           if torch.distributed.get_rank() == 0:
+               print ("PPPPPPPPPPPPPPPPPP pixel_values is : ", pixel_values.shape)
+
+        if torch.distributed.get_rank() == 0:
+            print ("PPPPPPPPPPPPPPPPPP222 image_embeds is : ", image_embeds)
+
+        if image_grid_thw is not None:
+            if torch.distributed.get_rank() == 0:
+                print ("PPPPPPPPPPPPPPPPPP3333 image_grid_thw is : ", image_grid_thw)
+                print ("PPPPPPPPPPPPPPPPPP3333444 image_grid_thw is : ", image_grid_thw.shape)
+
         if pixel_values is None and image_embeds is None:
             return None
 
         if pixel_values is not None:
             pixel_values = self._validate_and_reshape_mm_tensor(
                 pixel_values, "image pixel values")
+
+            if torch.distributed.get_rank() == 0:
+                print ("PPPPPPPPPPPPPPPPPP5555 pixel_values is : ", pixel_values.shape)
+
             image_grid_thw = self._validate_and_reshape_mm_tensor(
                 image_grid_thw, "image grid_thw")
+
+            if torch.distributed.get_rank() == 0:
+                print ("PPPPPPPPPPPPPPPPPP6666 image_grid_thw is : ", image_grid_thw)
 
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError("Incorrect type of image pixel values. "
@@ -1459,9 +1782,20 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         image_input: Optional[Qwen2_5_VLImageInputs] = None,
         video_input: Optional[Qwen2_5_VLVideoInputs] = None,
     ) -> torch.Tensor:
+        if torch.distributed.get_rank() == 0:
+            print ("************************ input_ids is : ", input_ids)
+            print ("************************1 image_input is : ", image_input)
+
         inputs_embeds = self.get_input_embeddings(input_ids)
+        if torch.distributed.get_rank() == 0:
+            print ("************************2 get_input_embeddings_v0, inputs_embeds is : ", inputs_embeds.shape)
+
         if image_input is not None:
             image_embeds = self._process_image_input(image_input)
+            if torch.distributed.get_rank() == 0:
+                print ("************************3 get_input_embeddings_v0, _process_image_input return image_embeds is : ",
+                    image_embeds[0].shape, "  len is : ", len(image_embeds))
+
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
                 inputs_embeds,

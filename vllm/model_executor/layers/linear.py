@@ -1366,7 +1366,14 @@ class RowParallelLinear(LinearBase):
     def forward(
         self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+
+#        if torch.distributed.get_rank() == 0:
+#            print ("(((((((((((((((( RowParallelLinear, input shape is", input_.shape)
+
         input_parallel = self.resolve_input(input_)
+
+#        if torch.distributed.get_rank() == 0:
+#            print ("((((((((((((((((222 RowParallelLinear, input_parallel shape is", input_parallel.shape)
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -1376,10 +1383,17 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self,
                                                   input_parallel,
                                                   bias=bias_)
+
+#        if torch.distributed.get_rank() == 0:
+#            print ("((((((((((((((((333 RowParallelLinear, output_parallel shape is", output_parallel.shape)
+
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
+
+#        if torch.distributed.get_rank() == 0:
+#            print ("((((((((((((((((555 RowParallelLinear, output shape is", output.shape)
 
         output_bias = self.bias if self.skip_bias_add else None
 

@@ -84,6 +84,7 @@ _MAX_FRAMES_PER_VIDEO = 16
 
 # === Vision Inputs === #
 
+layer_nth=0
 
 class Qwen2VLImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
@@ -212,6 +213,8 @@ def apply_rotary_emb_torch(x: torch.Tensor,
     x: (batch_size, seqlen, nheads, headdim)
     cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
     """
+    global layer_nth
+
     ro_dim = cos.shape[-1] * 2
     assert ro_dim <= x.shape[-1]
     cos = repeat(
@@ -220,6 +223,10 @@ def apply_rotary_emb_torch(x: torch.Tensor,
     sin = repeat(
         sin,
         "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("##########222 apply_rotary_emb_torch, cos shape is : ", cos.shape, "  sin shape is : ", sin.shape)
+
     return torch.cat(
         [
             x[..., :ro_dim] * cos +
@@ -234,10 +241,22 @@ def apply_rotary_pos_emb_vision(t: torch.Tensor,
     t_ = t.float()
     cos = freqs.cos()
     sin = freqs.sin()
+
+    global layer_nth
+
+    layer_nth += 1
+
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("########## apply_rotary_pos_emb_vision, t shape is : ", t.shape, "  cos shape is : ", cos.shape)
+
     apply_rotary_emb = apply_rotary_emb_torch
-    if current_platform.is_cuda():
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+#    if current_platform.is_cuda():
+#        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
     output = apply_rotary_emb(t_, cos, sin).type_as(t)
+
+    if layer_nth == 1 and torch.distributed.get_rank() == 0:
+        print ("##########3333 apply_rotary_pos_emb_vision, output shape is : ", output.shape)
+
     return output
 
 
