@@ -66,7 +66,7 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
                                         PromptUpdate, PromptUpdateDetails)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
-from vllm.platforms import _Backend
+from vllm.platforms import _Backend, current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
 
@@ -78,6 +78,11 @@ from .utils import (AutoWeightsLoader, WeightsMapper,
                     init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
 from .vision import get_vit_attn_backend
+
+is_hpu = current_platform.is_hpu()
+if is_hpu:
+    import habana_frameworks.torch.core as htcore
+
 
 logger = init_logger(__name__)
 
@@ -705,6 +710,9 @@ class Glm4vVisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        torch.set_printoptions(edgeitems=15)
+        htcore.mark_step()
+
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
@@ -727,6 +735,9 @@ class Glm4vVisionTransformer(nn.Module):
         max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+
+        htcore.mark_step()
+
         return rotary_pos_emb, pos_ids
 
     def compute_attn_mask_seqlen(
@@ -757,8 +768,12 @@ class Glm4vVisionTransformer(nn.Module):
                                                  dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
+        htcore.mark_step()
+
         # pre-compute seqlens for attn mask to reduce cuMemcpy operations
         max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
+
+        htcore.mark_step()
         x = self.embeddings(x, seqlens, grid_thw, image_type_ids[:, 0],
                             image_type_ids[:, 1])
 
@@ -1079,7 +1094,6 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
         prompt: str,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         mm_data = dict(mm_data)
         processor = self.info.get_hf_processor(**mm_kwargs)
@@ -1126,7 +1140,6 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
                     prompt="<|begin_of_video|><|video|><|end_of_video|>",
                     mm_data=video_mm_data,
                     mm_kwargs=mm_kwargs,
-                    tok_kwargs=tok_kwargs,
                 )
                 input_ids = video_outputs.pop("input_ids")
                 input_ids[input_ids == processor.image_token_id] = (
@@ -1153,7 +1166,6 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
             prompt=prompt,
             mm_data=mm_data,
             mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
         )
         combined_outputs = dict(
             processed_outputs,

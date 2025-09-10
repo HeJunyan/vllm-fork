@@ -285,7 +285,7 @@ def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
 
 # GLM-4.5V
 def run_glm4_5v(questions: list[str], modality: str) -> ModelRequestData:
-    model_name = "zai-org/GLM-4.5V"
+    model_name = "/host/mnt/ceph1/robinhe/hf_home/GLM-4.5V/"
 
     engine_args = EngineArgs(
         model=model_name,
