@@ -248,6 +248,7 @@ def apply_rotary_pos_emb_vision(t: torch.Tensor,
 
     if layer_nth == 1 and torch.distributed.get_rank() == 0:
         print ("########## apply_rotary_pos_emb_vision, t shape is : ", t.shape, "  cos shape is : ", cos.shape)
+        print ("##########222 apply_rotary_pos_emb_vision, freqs shape is : ", freqs.shape)
 
     apply_rotary_emb = apply_rotary_emb_torch
 #    if current_platform.is_cuda():

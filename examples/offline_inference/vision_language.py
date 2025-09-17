@@ -298,6 +298,7 @@ def run_glm4_5v(questions: list[str], modality: str) -> ModelRequestData:
         limit_mm_per_prompt={modality: 1},
         enforce_eager=True,
         tensor_parallel_size=4,
+        load_format="dummy",
     )
 
     if modality == "image":

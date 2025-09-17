@@ -26,6 +26,7 @@
 # limitations under the License.
 """Inference-only GLM-4V model compatible with HuggingFace weights."""
 
+import os
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
@@ -80,8 +81,10 @@ from .utils import (AutoWeightsLoader, WeightsMapper,
 from .vision import get_vit_attn_backend
 
 is_hpu = current_platform.is_hpu()
+is_hpu_2 = False
 if is_hpu:
     import habana_frameworks.torch.core as htcore
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
 
 logger = init_logger(__name__)
@@ -272,6 +275,9 @@ class Glm4vVisionAttention(nn.Module):
             raise RuntimeError(
                 f"GLM-4V does not support {self.attn_backend} backend now.")
 
+        self.softmax_mode = 'fp32' if os.environ.get(
+            'VLLM_FP32_SOFTMAX_VISION', 'false').lower() in ['true', '1' ] else 'None'
+
     def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # [s, b, 3 * head * head_dim]
         seq_len, bs, _ = qkv.shape
@@ -309,6 +315,7 @@ class Glm4vVisionAttention(nn.Module):
             rotary_pos_emb: torch.Tensor,
             max_seqlen: Optional[int] = None,  # Only used for Flash Attention
             seqlens: Optional[list[int]] = None,  # Only used for xFormers
+            fullattn_mask: Optional[torch.Tensor] = None, # Only used for gaudi
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
@@ -345,6 +352,22 @@ class Glm4vVisionAttention(nn.Module):
             context_layer = rearrange(output,
                                       "(b s) ... -> b s ...",
                                       b=batch_size)
+        elif self.attn_backend == _Backend.TORCH_SDPA and is_hpu_2:
+            assert cu_seqlens.shape[0] <= 3, "Only support one image plus padding"
+            assert fullattn_mask is not None, \
+                "Should call to here from Glm4vVisionTransformerStaticShape"
+
+            q1, k1, v1 = (rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
+            (batch_size, _, seq_len_N_t, _) = q1.shape
+            (batch_size, _, seq_len_N_s, _) = k1.shape
+            mask_shape = (batch_size, 1, seq_len_N_t, seq_len_N_s)
+            attn_mask = fullattn_mask.reshape(
+                    batch_size, 1, seq_len_N_t, seq_len_N_s,
+                    -1)[:, :, :, :, 0]  # reshapes the mask to be Bx1xNxN
+            assert attn_mask.shape == mask_shape
+            fused_out = FusedSDPA.apply(q1, k1, v1, attn_mask, 0.0,
+                  False, None, self.softmax_mode)
+            context_layer = rearrange(fused_out, "b h s d -> b s h d ")
         elif self.attn_backend == _Backend.TORCH_SDPA:
             # Execute attention entry by entry for speed & less VRAM.
             outputs = []
@@ -419,6 +442,7 @@ class Glm4vVisionBlock(nn.Module):
             rotary_pos_emb: torch.Tensor,
             max_seqlen: Optional[int] = None,  # Only used for Flash Attention
             seqlens: Optional[list[int]] = None,  # Only used for xFormers
+            fullattn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -426,6 +450,7 @@ class Glm4vVisionBlock(nn.Module):
             rotary_pos_emb=rotary_pos_emb,
             max_seqlen=max_seqlen,
             seqlens=seqlens,
+            fullattn_mask=fullattn_mask,
         )
 
         x = x + self.mlp(self.norm2(x))
@@ -537,6 +562,11 @@ class Glm4vVisionEmbeddings(nn.Module):
         # Move coordinates to correct device
         h_coords, w_coords = h_coords.to(device), w_coords.to(device)
 
+        if torch.distributed.get_rank() == 0:
+            print ("((((((( h_coords is : ", h_coords, "  shape is : ", h_coords.shape)
+            print ("(((((((111 w_coords is : ", w_coords, "  shape is : ", w_coords.shape)
+            print ("(((((((222 position_embedding is : ", pos_embed_weight.shape)
+
         # Handle empty sequence case
         if total_seq == 0:
             adapted_pos_embed = torch.empty(0,
@@ -549,10 +579,17 @@ class Glm4vVisionEmbeddings(nn.Module):
                 lengths = torch.tensor(lengths,
                                        device=device,
                                        dtype=torch.long)
+
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((555 lengths is : ", lengths)
+
             if not isinstance(image_shapes, torch.Tensor):
                 image_shapes = torch.tensor(image_shapes,
                                             device=device,
                                             dtype=torch.long)
+
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((666 image_shapes is : ", image_shapes)
 
             # Prepare 2D position embedding
             orig_size_sq = pos_embed_weight.shape[0]
@@ -562,26 +599,41 @@ class Glm4vVisionEmbeddings(nn.Module):
                 hidden_size).permute(2, 0,
                                      1).unsqueeze(0).to(device=device,
                                                         dtype=torch.float32))
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((777 pos_embed_2d is : ", pos_embed_2d.shape)
+
 
             # Calculate target dimensions for each patch
             target_h = torch.cat([
                 image_shapes[i, 1].repeat(lengths[i])
                 for i in range(len(lengths))
             ]).to(device=device, dtype=torch.float32)
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((888 target_h is : ", target_h)
+
             target_w = torch.cat([
                 image_shapes[i, 2].repeat(lengths[i])
                 for i in range(len(lengths))
             ]).to(device=device, dtype=torch.float32)
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((999 target_w is : ", target_w)
+
 
             # Normalize coordinates to [-1, 1] range for grid_sample
             h_coords = h_coords.to(device=device, dtype=torch.float32)
             w_coords = w_coords.to(device=device, dtype=torch.float32)
             norm_w = ((w_coords + 0.5) / target_w) * 2 - 1
             norm_h = ((h_coords + 0.5) / target_h) * 2 - 1
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((10 norm_w is : ", norm_w, "  shape is : ", norm_w.shape)
+                print ("(((((((11 norm_h is : ", norm_h, "  shape is : ", norm_h.shape)
 
             # Create sampling grid
             grid = (torch.stack((norm_w, norm_h),
                                 dim=-1).unsqueeze(0).unsqueeze(2))
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((12 grid is : ", grid.shape)
+
 
             # Perform bicubic interpolation
             interpolated_embed_fp32 = F.grid_sample(
@@ -591,12 +643,17 @@ class Glm4vVisionEmbeddings(nn.Module):
                 align_corners=False,
                 padding_mode="border",
             )
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((13 interpolated_embed_fp32 is : ", interpolated_embed_fp32.shape)
+
 
             # Reshape and convert back to original dtype
             adapted_pos_embed_fp32 = (
                 interpolated_embed_fp32.squeeze(0).squeeze(-1).permute(1, 0))
             adapted_pos_embed = adapted_pos_embed_fp32.to(
                 pos_embed_weight.dtype).to(embeddings.device)
+            if torch.distributed.get_rank() == 0:
+                print ("(((((((14 adapted_pos_embed is : ", adapted_pos_embed.shape)
 
         # Add adapted position encoding to embeddings
         embeddings = embeddings + adapted_pos_embed
@@ -710,13 +767,16 @@ class Glm4vVisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        torch.set_printoptions(edgeitems=15)
-        htcore.mark_step()
-
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
             wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+
+            torch.set_printoptions(edgeitems=10)
+
+#            if torch.distributed.get_rank() == 0:
+#                print ("@@@@@@@@@@ rot_pos_emb, hpos_ids is : ", hpos_ids, " wpos_ids is : ", wpos_ids)
+
             hpos_ids = (hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
@@ -729,14 +789,24 @@ class Glm4vVisionTransformer(nn.Module):
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             ).permute(0, 2, 1, 3).flatten())
+#            if torch.distributed.get_rank() == 0:
+#                print ("@@@@@@@@@@ 111 rot_pos_emb, after shape hpos_ids is : ", hpos_ids, " wpos_ids is : ", wpos_ids)
+
             pos_ids.append(
                 torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+
         pos_ids = torch.cat(pos_ids, dim=0)
+        if torch.distributed.get_rank() == 0:
+            print ("@@@@@@@@@@ 222 rot_pos_emb, pos_ids is : ", pos_ids, " shape is : ", pos_ids.shape)
+
         max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        if torch.distributed.get_rank() == 0:
+            print ("@@@@@@@@@@ 333 rot_pos_emb, rotary_pos_emb_full is : ", rotary_pos_emb_full.shape)
 
-        htcore.mark_step()
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        if torch.distributed.get_rank() == 0:
+            print ("@@@@@@@@@@ 555 rot_pos_emb, rotary_pos_emb is : ", rotary_pos_emb.shape)
 
         return rotary_pos_emb, pos_ids
 
@@ -756,26 +826,43 @@ class Glm4vVisionTransformer(nn.Module):
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
         # patchify
+
+        if torch.distributed.get_rank() == 0:
+            print ("============ Glm4vVisionTransformer forward, x is : ", x.shape, "  grid_thw is : ", grid_thw)
+
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
+        if torch.distributed.get_rank() == 0:
+            print ("============222 Glm4vVisionTransformer after patch_embed, x is : ", x.shape)
+
         x = self.post_conv_layernorm(x)
 
         # compute position embedding
         rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw)
+        if torch.distributed.get_rank() == 0:
+            print ("============333 Glm4vVisionTransformer after rot_pos_emb, rotary_pos_emb is : ",
+                rotary_pos_emb.shape, " image_type_ids is : ", image_type_ids.shape)
+
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                              grid_thw[:, 0]).cumsum(
                                                  dim=0, dtype=torch.int32)
+        if torch.distributed.get_rank() == 0:
+            print ("============444 Glm4vVisionTransformer cu_seqlens is : ", cu_seqlens)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
-
-        htcore.mark_step()
+        if torch.distributed.get_rank() == 0:
+            print ("============444 Glm4vVisionTransformer, after pad, cu_seqlens is : ", cu_seqlens)
 
         # pre-compute seqlens for attn mask to reduce cuMemcpy operations
         max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
+        if torch.distributed.get_rank() == 0:
+            print ("============555 Glm4vVisionTransformer, after compute_attn_mask_seqlen, max_seqlen is : ",
+                max_seqlen, " seqlens is : ", seqlens)
 
-        htcore.mark_step()
         x = self.embeddings(x, seqlens, grid_thw, image_type_ids[:, 0],
                             image_type_ids[:, 1])
+        if torch.distributed.get_rank() == 0:
+            print ("============666 Glm4vVisionTransformer, after embeddings, x is : ", x.shape)
 
         # transformers
         x = x.unsqueeze(1)
@@ -829,6 +916,216 @@ class Glm4vVisionTransformer(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
+    """
+    Here we overwrite some of the methods of Glm4vVisionTransformer
+    to make the model more friendly to static shapes. Specifically,
+    we split the forward  method into:
+      - pre_attn (dynamic)
+      - forward (static shape)
+      - post_attn (dynamic)
+    and we should call get_image_embeds instead of forward, allowing
+    the forward method ro run with HPU_Graphs, whereas the
+    pre_attn and post_attn methods are allow to be dynamic.
+    """
+    def pad_multimodal_data(self, pixel_values, image_grid_thw,
+                            vision_buckets):
+        assert pixel_values.shape[0] % 64 == 0, 'needs 64 aligned resolution'
+
+        desired_number_of_pixels = vision_buckets.get_multimodal_bucket(
+            pixel_values.shape[0])
+        padding_len = desired_number_of_pixels - pixel_values.shape[0]
+        if padding_len <= 0:
+            return pixel_values, image_grid_thw
+
+        logger_msg = "Padding current number pixel " \
+            + str(pixel_values.shape[0]) + " to "+ str(desired_number_of_pixels)
+        logger.info(logger_msg)
+
+        assert padding_len % 64 == 0, 'padding needs to be multiple of 64'
+
+        constant_value = -100
+        pixel_values = torch.cat([
+            pixel_values,
+            torch.ones((padding_len, pixel_values.shape[1]),
+                       device=pixel_values.device) * constant_value
+        ])
+
+        image_grid_thw = torch.cat([
+            image_grid_thw,
+            torch.tensor([[1, 8, padding_len // 8]],
+                         device=image_grid_thw.device)
+        ])
+
+        assert image_grid_thw.prod(-1).sum() == desired_number_of_pixels
+        return pixel_values, image_grid_thw
+
+    def forward(self,
+                x: torch.Tensor,
+                cu_seqlens: torch.Tensor,
+                rotary_pos_emb: torch.Tensor,
+                max_seqlen: Optional[int] = None,  # Only used for Flash Attention
+                fullattn_mask: Optional[torch.Tensor] = None, # Only used for Gaudi
+                ) -> torch.Tensor:
+        assert_msg = ("Expect inputs to be 112x112 aligned. "
+                      "Please align before sending image and "
+                      "check PR #1163 description for more details")
+        assert x.shape[0] % 64 == 0, assert_msg
+
+        hidden_states = x.unsqueeze(1)
+        for layer_num, blk in enumerate(self.blocks):
+            htcore.mark_step()
+            hidden_states = blk(hidden_states,
+                                cu_seqlens=cu_seqlens,
+                                rotary_pos_emb=rotary_pos_emb,
+                                max_seqlen=max_seqlen,
+                                fullattn_mask=fullattn_mask)
+
+        return hidden_states
+
+
+    def create_block_diagonal_attention_mask_outerprod(self, indices):
+        if torch.distributed.get_rank() == 0:
+            print ("???????????? create_block_diagonal_attention_mask_outerprod  indices is : ", indices, " shape is : ", indices.shape)
+        maxsize = indices[-1]
+        if torch.distributed.get_rank() == 0:
+            print ("????????????2 create_block_diagonal_attention_mask_outerprod maxsize is : ", maxsize)
+        range_to_max_for_each_img = torch.arange(
+            maxsize,
+            device=indices.device).unsqueeze(0).repeat(indices.shape[0] - 1, 1)
+
+        if torch.distributed.get_rank() == 0:
+            print ("????????????3 create_block_diagonal_attention_mask_outerprod range_to_max_for_each_img is : ",
+                range_to_max_for_each_img, " shape is : ", range_to_max_for_each_img.shape)
+        lesser = range_to_max_for_each_img < indices[1:].unsqueeze(1)
+
+        if torch.distributed.get_rank() == 0:
+            print ("????????????4 create_block_diagonal_attention_mask_outerprod lesser is : ",
+                lesser, " shape is : ", lesser.shape)
+        greater_eq = range_to_max_for_each_img >= indices[:-1].unsqueeze(1)
+        if torch.distributed.get_rank() == 0:
+            print ("????????????5 create_block_diagonal_attention_mask_outerprod greater_eq is : ",
+                greater_eq, " shape is : ", greater_eq.shape)
+        range_indices = torch.logical_and(lesser, greater_eq).float()
+
+        if torch.distributed.get_rank() == 0:
+            print ("????????????6 create_block_diagonal_attention_mask_outerprod range_indices is : ",
+                range_indices, " shape is : ", range_indices.shape)
+
+        # can reduce sum externally or as batchmatmul
+        if range_indices.shape[-1] > 40000:
+            log_msg = "einsum running on CPU :" + str(range_indices.shape)
+            logger.info(log_msg)
+            range_indices = range_indices.to("cpu")
+            res = torch.einsum('bi,bj->ij', range_indices, range_indices)
+            res = res.to("hpu")
+        else:
+            res = torch.einsum('bi,bj->ij', range_indices, range_indices)
+            if torch.distributed.get_rank() == 0:
+                 print ("????????????6 create_block_diagonal_attention_mask_outerprod res is : ",
+                    res, " shape is : ", res.shape)
+        return res.bool()
+
+    def pre_attn(self, x: torch.Tensor, grid_thw: torch.Tensor):
+        hidden_states = x.to(device=self.device, dtype=self.dtype)
+        # hidden_states is [patch_num, patch_pixes]
+        hidden_states = self.patch_embed(hidden_states)
+        # hidden_states is [patch_num, patch_dim]
+        hidden_states = self.post_conv_layernorm(hidden_states)
+        # hidden_states is [patch_num, patch_dim]
+
+        # compute position embedding
+        rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw)
+        # rotary_pos_emb is [patch_num, patch_dim/num_heads/2]
+        # image_type_ids is [patch_num, 2--->(w_index, h_index)]
+        
+        # compute cu_seqlens
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
+                                             grid_thw[:, 0]).cumsum(
+                                                 dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        # cu_seqlens is 1 Dim tensor, [0, w1xH1, w1xH1*2, ...,  w1xH1*T, W2xH2, ...]
+
+        max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
+        # seqlens is a list of cu_seqlens values
+
+        hidden_states = self.embeddings(hidden_states, seqlens, grid_thw,
+            image_type_ids[:, 0], image_type_ids[:, 1])
+        # Add a pos embed on hidden_states, shape unchanged
+
+        return (hidden_states, rotary_pos_emb, cu_seqlens, max_seqlen)
+
+    def get_image_embeds(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        vision_buckets,
+    ) -> torch.Tensor:
+        # first, align the image to 64
+        num_patches = pixel_values.shape[0]
+        if num_patches % 64 != 0:
+            assert num_patches > 64, "Image needs to be at least 112 x 112"
+            logger_msg = (
+                "GLM 4_1VL for HPU is under development. "
+                "Image height and width need to be multiples of 112 pixels. "
+                "We are prunning the last visual tokens to comply with this "
+                "requirement but this leads to accuracy degradation. "
+                "Please, reshape the images or use this custom transformer "
+                "that does the resizing/alignment automatically: "
+                "pip install "
+                "git+https://github.com/malkomes/transformers.git"
+                "@ac372cd18f836c41f57cdce46094db00019d4280"
+                "See PR #1163 description, for more details")
+            logger.warning_once(logger_msg)
+
+            # reshape grid_thw with multiples of 8
+            old_img_sizes = []
+            new_img_sizes = []
+            for img_idx in range(grid_thw.shape[0]):
+                img_shape = grid_thw[img_idx, :].tolist()
+                tt, hh, ww = img_shape
+                hh_new = (hh // 8) * 8
+                ww_new = (ww // 8) * 8
+                old_img_sizes.append(tt * hh * ww)
+                new_img_sizes.append(tt * hh_new * ww_new)
+                grid_thw[img_idx, 1] = hh_new
+                grid_thw[img_idx, 2] = ww_new
+
+            # truncate pixel_values to new shapes
+            copy_pointer = 0
+            paste_pointer = 0
+            for old_img_size, new_img_size in zip(old_img_sizes, new_img_sizes):
+                pixel_values[paste_pointer:paste_pointer + new_img_size, :] = \
+                    pixel_values[copy_pointer:copy_pointer + new_img_size, :]
+                copy_pointer += old_img_size
+                paste_pointer += new_img_size
+
+            pixel_values = pixel_values[:paste_pointer, :]
+
+        offset = 0
+        results = []
+        for img_idx in range(grid_thw.shape[0]):
+            img_shape = grid_thw[img_idx, :].unsqueeze(0)
+            curr_img_size = img_shape.prod()
+
+            pixel_values_curr_img = pixel_values[offset:offset + curr_img_size, :]
+            offset += curr_img_size
+
+            pixel_values_curr_img_padded, img_shape_padded = self.pad_multimodal_data(
+                pixel_values_curr_img, img_shape, vision_buckets=vision_buckets)
+
+            pixel_values_curr_img_padded, rot_pos_emb, cu_seqlens, max_seqlen = \
+                self.pre_attn(pixel_values_curr_img_padded, img_shape_padded)
+
+            fullatt_block_attn_mask = self.create_block_diagonal_attention_mask_outerprod(cu_seqlens)
+            assert pixel_values_curr_img_padded.shape[0] == cu_seqlens[-1] == rot_pos_emb.shape[0]
+
+            hidden_states = self.forward(pixel_values_curr_img_padded,
+                                         rotary_pos_emb=rot_pos_emb,
+                                         cu_seqlens=cu_seqlens,
+                                         max_seqlen=max_seqlen,
+                                         fullattn_mask=fullatt_block_attn_mask)
 
 
 class Glm4vProcessingInfo(BaseProcessingInfo):
@@ -1279,7 +1576,12 @@ class Glm4vForConditionalGeneration(nn.Module, SupportsMultiModal,
         self.config = config
         self.multimodal_config = multimodal_config
 
-        self.visual = Glm4vVisionTransformer(
+        if is_hpu_2:
+            glm_visionTransformer = Glm4vVisionTransformerStaticShape
+        else:
+            glm_visionTransformer = Glm4vVisionTransformer
+
+        self.visual = glm_visionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-5),
             quant_config=quant_config,
@@ -1402,7 +1704,15 @@ class Glm4vForConditionalGeneration(nn.Module, SupportsMultiModal,
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-            image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+            if is_hpu_2:
+                assert isinstance(self.visual, Glm4vVisionTransformerStaticShape)
+                image_embeds = self.visual.get_image_embeds(
+                    pixel_values,
+                    grid_thw=grid_thw,
+                    vision_buckets=self.vision_buckets,
+                )
+            else:
+                image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
@@ -1423,8 +1733,15 @@ class Glm4vForConditionalGeneration(nn.Module, SupportsMultiModal,
         else:
             pixel_values_videos = video_input["pixel_values_videos"].type(
                 self.visual.dtype)
-            video_embeds = self.visual(pixel_values_videos,
-                                       grid_thw=flat_grid_thw)
+            if is_hpu_2:
+                assert isinstance(self.visual, Glm4vVisionTransformerStaticShape)
+                video_embeds = self.visual.get_image_embeds(
+                    pixel_values_videos,
+                    grid_thw=grid_thw,
+                    vision_buckets=self.vision_buckets,
+                )
+            else:
+                video_embeds = self.visual(pixel_values_videos, grid_thw=flat_grid_thw)
 
         # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size
