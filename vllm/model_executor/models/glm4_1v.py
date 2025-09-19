@@ -1077,7 +1077,7 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
 
         hidden_states = self.downsample(hidden_states).view(-1, self.out_hidden_size)
 
-        hidden_states = self.merger(hidden_statess)
+        hidden_states = self.merger(hidden_states)
 
         return hidden_states
 
@@ -1165,7 +1165,7 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
             image_embeds = self.post_attn(hidden_states)
 
             # slice image_embeds to remove the padded parts
-            pad_index = img_shape_padded[0].prod() // self.spatial_merge_unit
+            pad_index = img_shape_padded[0].prod() // (self.spatial_merge_size**2)
             results += [image_embeds[:pad_index, :]]
 
         results_cat = torch.concat(results)
