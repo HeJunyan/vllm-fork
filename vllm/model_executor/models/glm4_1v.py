@@ -1069,6 +1069,19 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
 
         return (hidden_states, rotary_pos_emb, cu_seqlens, max_seqlen)
 
+    def post_attn(self, hidden_states: torch.Tensor):
+        hidden_states = self.post_layernorm(hidden_states)
+        hidden_states = hidden_states.view(-1, self.spatial_merge_size, self.spatial_merge_size,
+                   hidden_states.shape[-1])
+        hidden_states = hidden_states.permute(0, 3, 1, 2)
+
+        hidden_states = self.downsample(hidden_states).view(-1, self.out_hidden_size)
+
+        hidden_states = self.merger(hidden_statess)
+
+        return hidden_states
+
+
     def get_image_embeds(
         self,
         pixel_values: torch.Tensor,
@@ -1149,6 +1162,14 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
                                          max_seqlen=max_seqlen,
                                          fullattn_mask=fullatt_block_attn_mask)
 
+            image_embeds = self.post_attn(hidden_states)
+
+            # slice image_embeds to remove the padded parts
+            pad_index = img_shape_padded[0].prod() // self.spatial_merge_unit
+            results += [image_embeds[:pad_index, :]]
+
+        results_cat = torch.concat(results)
+        return results_cat
 
 class Glm4vProcessingInfo(BaseProcessingInfo):
 
