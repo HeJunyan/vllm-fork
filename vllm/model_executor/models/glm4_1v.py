@@ -81,7 +81,7 @@ from .utils import (AutoWeightsLoader, WeightsMapper,
 from .vision import get_vit_attn_backend
 
 is_hpu = current_platform.is_hpu()
-is_hpu_2 = False
+is_hpu_2 = True
 if is_hpu:
     import habana_frameworks.torch.core as htcore
     from habana_frameworks.torch.hpex.kernels import FusedSDPA
@@ -958,6 +958,9 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
                          device=image_grid_thw.device)
         ])
 
+        if torch.distributed.get_rank() == 0:
+            print ("oooooooooooooooooooo 333 image_grid_thw is : ", image_grid_thw)
+
         assert image_grid_thw.prod(-1).sum() == desired_number_of_pixels
         return pixel_values, image_grid_thw
 
@@ -1031,6 +1034,9 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
         hidden_states = x.to(device=self.device, dtype=self.dtype)
         # hidden_states is [patch_num, patch_pixes]
         hidden_states = self.patch_embed(hidden_states)
+        if torch.distributed.get_rank() == 0:
+            print (">>>>>>>> pre_attn after patch_embed, hidden_states is : ", hidden_states.shape)
+
         # hidden_states is [patch_num, patch_dim]
         hidden_states = self.post_conv_layernorm(hidden_states)
         # hidden_states is [patch_num, patch_dim]
@@ -1039,6 +1045,9 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
         rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw)
         # rotary_pos_emb is [patch_num, patch_dim/num_heads/2]
         # image_type_ids is [patch_num, 2--->(w_index, h_index)]
+        if torch.distributed.get_rank() == 0:
+            print (">>>>>>>> 222 pre_attn after patch_embed after rot_pos_emb, rotary_pos_emb is : ",
+                rotary_pos_emb.shape, " image_type_ids is : ", image_type_ids.shape)
         
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
@@ -1046,6 +1055,8 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
                                                  dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
         # cu_seqlens is 1 Dim tensor, [0, w1xH1, w1xH1*2, ...,  w1xH1*T, W2xH2, ...]
+        if torch.distributed.get_rank() == 0:
+            print (">>>>>>>> 333 pre_attn cu_seqlens is : ", cu_seqlens)
 
         max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         # seqlens is a list of cu_seqlens values
@@ -1053,6 +1064,8 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
         hidden_states = self.embeddings(hidden_states, seqlens, grid_thw,
             image_type_ids[:, 0], image_type_ids[:, 1])
         # Add a pos embed on hidden_states, shape unchanged
+        if torch.distributed.get_rank() == 0:
+            print (">>>>>>>> 555 pre_attn hidden_states return is : ", hidden_states.shape)
 
         return (hidden_states, rotary_pos_emb, cu_seqlens, max_seqlen)
 
@@ -1062,6 +1075,9 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
         grid_thw: torch.Tensor,
         vision_buckets,
     ) -> torch.Tensor:
+        if torch.distributed.get_rank() == 0:
+            print ("============== get_image_embeds, input pix_value is : ", pixel_values.shape, " grid_thw is : ", grid_thw)
+
         # first, align the image to 64
         num_patches = pixel_values.shape[0]
         if num_patches % 64 != 0:
@@ -1103,6 +1119,9 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
 
             pixel_values = pixel_values[:paste_pointer, :]
 
+        if torch.distributed.get_rank() == 0:
+            print ("============== 222 get_image_embeds, after align input pix_value is : ", pixel_values.shape, " grid_thw is : ", grid_thw)
+
         offset = 0
         results = []
         for img_idx in range(grid_thw.shape[0]):
@@ -1114,6 +1133,9 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
 
             pixel_values_curr_img_padded, img_shape_padded = self.pad_multimodal_data(
                 pixel_values_curr_img, img_shape, vision_buckets=vision_buckets)
+            if torch.distributed.get_rank() == 0:
+                print ("============== 333 get_image_embeds, after pad_multimodal_data, pixel_values_curr_img_padded is : ",
+                    pixel_values_curr_img_padded.shape, " img_shape is : ", img_shape_padded)
 
             pixel_values_curr_img_padded, rot_pos_emb, cu_seqlens, max_seqlen = \
                 self.pre_attn(pixel_values_curr_img_padded, img_shape_padded)
