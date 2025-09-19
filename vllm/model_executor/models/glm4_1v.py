@@ -931,8 +931,6 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
     """
     def pad_multimodal_data(self, pixel_values, image_grid_thw,
                             vision_buckets):
-        assert pixel_values.shape[0] % 64 == 0, 'needs 64 aligned resolution'
-
         desired_number_of_pixels = vision_buckets.get_multimodal_bucket(
             pixel_values.shape[0])
         padding_len = desired_number_of_pixels - pixel_values.shape[0]
@@ -943,8 +941,6 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
             + str(pixel_values.shape[0]) + " to "+ str(desired_number_of_pixels)
         logger.info(logger_msg)
 
-        assert padding_len % 64 == 0, 'padding needs to be multiple of 64'
-
         constant_value = -100
         pixel_values = torch.cat([
             pixel_values,
@@ -952,10 +948,20 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
                        device=pixel_values.device) * constant_value
         ])
 
+        # ensure W and H can be divided to self.spatial_merge_size
+        if padding_len % (self.spatial_merge_size**2) != 0:
+            raise ValueError("The padding length is not aligned to {self.spatial_merge_size}**2")
+
+        algined_padding_len = padding_len // (self.spatial_merge_size**2)
+        padding_h = algined_padding_len * self.spatial_merge_size
+        padding_w = padding_len // padding_h
+        while padding_w  < 8 and ((padding_h // 2) % self.spatial_merge_size) == 0:
+            padding_w *= 2
+            padding_h //= 2
+
         image_grid_thw = torch.cat([
             image_grid_thw,
-            torch.tensor([[1, 8, padding_len // 8]],
-                         device=image_grid_thw.device)
+            torch.tensor([[1, padding_w, padding_h]], device=image_grid_thw.device)
         ])
 
         if torch.distributed.get_rank() == 0:
@@ -1093,44 +1099,7 @@ class Glm4vVisionTransformerStaticShape(Glm4vVisionTransformer):
 
         # first, align the image to 64
         num_patches = pixel_values.shape[0]
-        if num_patches % 64 != 0:
-            assert num_patches > 64, "Image needs to be at least 112 x 112"
-            logger_msg = (
-                "GLM 4_1VL for HPU is under development. "
-                "Image height and width need to be multiples of 112 pixels. "
-                "We are prunning the last visual tokens to comply with this "
-                "requirement but this leads to accuracy degradation. "
-                "Please, reshape the images or use this custom transformer "
-                "that does the resizing/alignment automatically: "
-                "pip install "
-                "git+https://github.com/malkomes/transformers.git"
-                "@ac372cd18f836c41f57cdce46094db00019d4280"
-                "See PR #1163 description, for more details")
-            logger.warning_once(logger_msg)
-
-            # reshape grid_thw with multiples of 8
-            old_img_sizes = []
-            new_img_sizes = []
-            for img_idx in range(grid_thw.shape[0]):
-                img_shape = grid_thw[img_idx, :].tolist()
-                tt, hh, ww = img_shape
-                hh_new = (hh // 8) * 8
-                ww_new = (ww // 8) * 8
-                old_img_sizes.append(tt * hh * ww)
-                new_img_sizes.append(tt * hh_new * ww_new)
-                grid_thw[img_idx, 1] = hh_new
-                grid_thw[img_idx, 2] = ww_new
-
-            # truncate pixel_values to new shapes
-            copy_pointer = 0
-            paste_pointer = 0
-            for old_img_size, new_img_size in zip(old_img_sizes, new_img_sizes):
-                pixel_values[paste_pointer:paste_pointer + new_img_size, :] = \
-                    pixel_values[copy_pointer:copy_pointer + new_img_size, :]
-                copy_pointer += old_img_size
-                paste_pointer += new_img_size
-
-            pixel_values = pixel_values[:paste_pointer, :]
+        assert num_patches % (self.spatial_merge_size**2) == 0, " Patches num not align."
 
         if torch.distributed.get_rank() == 0:
             print ("============== 222 get_image_embeds, after align input pix_value is : ", pixel_values.shape, " grid_thw is : ", grid_thw)
