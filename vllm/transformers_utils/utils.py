@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 from functools import cache
 from os import PathLike
 from pathlib import Path
@@ -97,3 +98,13 @@ def maybe_model_redirect(model: str) -> str:
         return redirect_model
 
     return model
+
+
+def convert_model_repo_to_path(model_repo: str) -> str:
+    """When VLLM_USE_MODELSCOPE is True convert a model
+    repository string to a Path str."""
+    if not envs.VLLM_USE_MODELSCOPE or Path(model_repo).exists():
+        return model_repo
+    from modelscope.utils.file_utils import get_model_cache_root
+
+    return os.path.join(get_model_cache_root(), model_repo)
