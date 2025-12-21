@@ -209,7 +209,8 @@ def is_mm_optimized(model):
     return 'Gemma3ForConditionalGeneration' in str(type(model.model)) \
         if hasattr(model, 'model') else \
         'Gemma3ForConditionalGeneration' in str(type(model)) or \
-        'DeepseekOCRForCausalLM' in str(type(model))
+        'DeepseekOCRForCausalLM' in str(type(model)) or \
+        'HunYuanVLForConditionalGeneration' in str(type(model))
 
 
 def fixed_sub_image_list(model):
@@ -3367,6 +3368,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         num_iters=3,
                         align_worker=False,
                         is_dummy_run=False) -> None:
+        return
         phase = 'prompt' if is_prompt else 'decode'
         use_graphs = is_dummy_run or self._use_graphs(batch_size, seq_len, ctx)
 
