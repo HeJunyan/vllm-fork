@@ -75,6 +75,7 @@ from .utils import (
     maybe_prefix,
 )
 
+only_first_time = 0
 
 def _is_moe(config: PretrainedConfig) -> bool:
     num_experts = getattr(config, "num_experts", None)
@@ -974,6 +975,25 @@ class HunyuanV1ModelBase(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        global only_first_time
+
+#        if torch.distributed.get_rank() == 0:
+#            print ("LLLLLLLLLLL only_first_time is : ", only_first_time)
+#            if only_first_time <= 2:
+#                if input_ids is not None:
+#                    print ("=================== input_ids shape is : ", input_ids.shape, "  @@@ input_ids is :", input_ids)
+#                if positions is not None:
+#                    torch.set_printoptions(edgeitems=125)
+#                    print ("=================== positions shape is : ", positions.shape, "  @@@ positions is :", positions)
+
+#                torch.set_printoptions(edgeitems=10)
+#                if intermediate_tensors is not None:
+#                    print ("=================== intermediate_tensors shape is : ", intermediate_tensors.shape, "  @@@ intermediate_tensors is :", intermediate_tensors)
+#                if inputs_embeds is not None:
+#                    print ("=================== inputs_embeds shape is : ", inputs_embeds.shape, "  @@@ inputs_embeds is :", inputs_embeds)
+#        only_first_time = only_first_time + 1
+
+
         model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

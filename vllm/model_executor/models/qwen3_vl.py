@@ -88,6 +88,8 @@ from .vision import get_vit_attn_backend
 logger = init_logger(__name__)
 is_hpu = current_platform.is_hpu()
 
+only_first_time = 0
+
 if is_hpu:
     import habana_frameworks.torch as htorch
     import habana_frameworks.torch.core as htcore
@@ -1562,6 +1564,24 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             video_grid_thw: Tensor `(n_videos, 3)` of video 3D grid in LLM.
                 `None` if no videos are passed.
         """
+
+        global only_first_time
+
+        if torch.distributed.get_rank() == 0:
+            print ("LLLLLLLLLLL only_first_time is : ", only_first_time)
+            if only_first_time <= 2:
+                if input_ids is not None:
+                    print ("=================== input_ids shape is : ", input_ids.shape, "  @@@ input_ids is :", input_ids)
+                if positions is not None:
+                    torch.set_printoptions(edgeitems=125)
+                    print ("=================== positions shape is : ", positions.shape, "  @@@ positions is :", positions)
+
+                torch.set_printoptions(edgeitems=10)
+                if intermediate_tensors is not None:
+                    print ("=================== intermediate_tensors shape is : ", intermediate_tensors.shape, "  @@@ intermediate_tensors is :", intermediate_tensors)
+                if inputs_embeds is not None:
+                    print ("=================== inputs_embeds shape is : ", inputs_embeds.shape, "  @@@ inputs_embeds is :", inputs_embeds)
+        only_first_time = only_first_time + 1
 
         if intermediate_tensors is not None:
             inputs_embeds = None

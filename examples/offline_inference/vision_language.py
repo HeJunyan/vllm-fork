@@ -389,6 +389,8 @@ def run_glm4_5v(questions: list[str], modality: str) -> ModelRequestData:
         },
         limit_mm_per_prompt={modality: 1},
         tensor_parallel_size=4,
+        enforce_eager=1,
+        load_format="dummy",
     )
 
     if modality == "image":
@@ -1365,6 +1367,8 @@ def run_qwen3_vl(questions: list[str], modality: str) -> ModelRequestData:
             "fps": 1,
         },
         limit_mm_per_prompt={modality: 1},
+        enforce_eager=1,
+        load_format="dummy",
     )
 
     if modality == "image":
@@ -1739,7 +1743,7 @@ def main(args):
     # even when all prompts are identical when running batch inference.
     sampling_params = (
         SamplingParams(
-            temperature=0.2, max_tokens=64, stop_token_ids=req_data.stop_token_ids
+            temperature=0.2, max_tokens=2, stop_token_ids=req_data.stop_token_ids
         )
         if req_data.sampling_params is None
         else req_data.sampling_params
