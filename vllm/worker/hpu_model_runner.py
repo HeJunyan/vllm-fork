@@ -1824,8 +1824,6 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             assert len(seq_ids) == 1
             seq_id = seq_ids[0]
 
-            print ("SSSSSSSSSSSSSSSSSSSSSSSSS seq_group_metadata is : ", seq_group_metadata)
-
             if self._is_fla_model():
                 mamba_cache_bs = self.max_num_seqs + \
                     max(8, self.max_num_seqs) + self.max_num_prefill_seqs
@@ -2239,6 +2237,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
         input_mrope_positions: List[List[int]] = [[] for _ in range(3)]
+        input_xdrope_positions: List[List[int]] = [[] for _ in range(4)]
         slot_mapping: List[List[int]] = []
         seq_lens: List[int] = []
         encoder_seq_lens: List[int] = []
@@ -2299,6 +2298,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     for idx in range(3):
                         input_mrope_positions[idx].extend(pos_for_mrope[idx])
 
+                if self.model_is_xdrope:
+                    pos_for_xdrope = [[position]] * 4
+                    for idx in range(4):
+                        input_xdrope_positions[idx].extend(pos_for_xdrope[idx])
+
                 seq_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window)
                 seq_lens.append(seq_len)
@@ -2340,10 +2344,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             real_batch_size = len(seq_group_metadata_list)
             input_tokens = output[:real_batch_size].clone()
 
-        input_positions = torch.tensor(
-            input_mrope_positions if self.model_is_mrope else input_positions,
-            dtype=torch.long,
-            device='cpu')
+        if self.model_is_mrope:
+            input_positions = torch.tensor(input_mrope_positions, dtype=torch.long, device='cpu')
+        elif self.model_is_xdrope:
+            input_positions = torch.tensor(input_xdrope_positions, dtype=torch.long, device='cpu')
+        else:
+            input_positions = torch.tensor(input_positions, dtype=torch.long, device='cpu')
 
         num_decode_tokens = len(seq_lens)
 

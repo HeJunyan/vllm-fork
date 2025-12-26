@@ -42,6 +42,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -209,6 +210,8 @@ class HunYuanAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=True,
         )
+
+        print ("__________________ self.num_heads is : ", self.num_heads, "  self.head_dim  is: ", self.head_dim, " self.num_kv_heads is :", self.num_kv_heads)
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -232,6 +235,9 @@ class HunYuanAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        original_q_shape = q.shape
+        original_k_shape = k.shape
+        
         ori_k = k
         if self.use_qk_norm:
             q = self.query_layernorm(
@@ -241,7 +247,9 @@ class HunYuanAttention(nn.Module):
                 k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
             )
 
-        attn_output = self.attn(q, k, v)
+        print ("WWWWWWWWWWWWWW q.shape is : ", q.shape, "  k.shape is : ", k.shape, "  v.shape is :", v.shape)
+
+        attn_output = self.attn(q.view(*original_q_shape), k.view(*original_k_shape), v)
         # For o_proj
         attn_output = attn_output.view(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -977,21 +985,21 @@ class HunyuanV1ModelBase(nn.Module, SupportsLoRA, SupportsPP):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         global only_first_time
 
-#        if torch.distributed.get_rank() == 0:
-#            print ("LLLLLLLLLLL only_first_time is : ", only_first_time)
-#            if only_first_time <= 2:
-#                if input_ids is not None:
-#                    print ("=================== input_ids shape is : ", input_ids.shape, "  @@@ input_ids is :", input_ids)
-#                if positions is not None:
+        if torch.distributed.get_rank() == 0:
+            print ("LLLLLLLLLLL only_first_time is : ", only_first_time)
+            if only_first_time <= 2:
+                if input_ids is not None:
+                    print ("=================== input_ids shape is : ", input_ids.shape, "  @@@ input_ids is :", input_ids)
+                if positions is not None:
 #                    torch.set_printoptions(edgeitems=125)
-#                    print ("=================== positions shape is : ", positions.shape, "  @@@ positions is :", positions)
+                    print ("=================== positions shape is : ", positions.shape, "  @@@ positions is :", positions)
 
-#                torch.set_printoptions(edgeitems=10)
-#                if intermediate_tensors is not None:
-#                    print ("=================== intermediate_tensors shape is : ", intermediate_tensors.shape, "  @@@ intermediate_tensors is :", intermediate_tensors)
-#                if inputs_embeds is not None:
-#                    print ("=================== inputs_embeds shape is : ", inputs_embeds.shape, "  @@@ inputs_embeds is :", inputs_embeds)
-#        only_first_time = only_first_time + 1
+#               torch.set_printoptions(edgeitems=10)
+                if intermediate_tensors is not None:
+                    print ("=================== intermediate_tensors shape is : ", intermediate_tensors.shape, "  @@@ intermediate_tensors is :", intermediate_tensors)
+                if inputs_embeds is not None:
+                    print ("=================== inputs_embeds shape is : ", inputs_embeds.shape, "  @@@ inputs_embeds is :", inputs_embeds)
+        only_first_time = only_first_time + 1
 
 
         model_output = self.model(
@@ -1002,8 +1010,9 @@ class HunyuanV1ModelBase(nn.Module, SupportsLoRA, SupportsPP):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
         return logits
 
     def make_empty_intermediate_tensors(

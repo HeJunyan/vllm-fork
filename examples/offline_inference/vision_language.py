@@ -1743,7 +1743,7 @@ def main(args):
     # even when all prompts are identical when running batch inference.
     sampling_params = (
         SamplingParams(
-            temperature=0.2, max_tokens=2, stop_token_ids=req_data.stop_token_ids
+            temperature=0.2, max_tokens=128, stop_token_ids=req_data.stop_token_ids
         )
         if req_data.sampling_params is None
         else req_data.sampling_params

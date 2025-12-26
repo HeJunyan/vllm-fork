@@ -46,6 +46,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
@@ -1047,8 +1048,9 @@ class HunYuanVLForConditionalGeneration(
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(hidden_states)
+        return self.language_model.compute_logits(hidden_states, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
@@ -1093,6 +1095,11 @@ class HunYuanVLForConditionalGeneration(
         """
         from .utils import _merge_multimodal_embeddings
 
+#        if input_ids is not None:
+#            print ("((((((((((( input_ids shape is : ", input_ids.shape, "  @@@ input_ids is :", input_ids)
+#        if multimodal_embeddings is not None:
+#            print ("((((((((((( 222 multimodal_embeddings shape is : ", multimodal_embeddings[0].shape, "  @@@ multimodal_embeddings is :", multimodal_embeddings[0])
+
         inputs_embeds = self._get_text_embeddings(
             input_ids,
             self.get_language_model().get_input_embeddings,
@@ -1102,8 +1109,11 @@ class HunYuanVLForConditionalGeneration(
             return inputs_embeds
 
         is_multimodal = (input_ids == self.config.image_token_id)
-        return _merge_multimodal_embeddings(inputs_embeds, is_multimodal,
+        ret = _merge_multimodal_embeddings(inputs_embeds, is_multimodal,
                                             multimodal_embeddings)
+
+        print ("((((((((((( 333 ret shape is : ", ret.shape, "  @@@ ret is :", ret)
+        return ret
 
     def prepare_attn_masks(
         self,
