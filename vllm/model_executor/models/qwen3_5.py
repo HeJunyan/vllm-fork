@@ -79,6 +79,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_triton import (
+    causal_conv1d_triton)
+from vllm.triton_utils import HAS_TRITON
 from vllm.model_executor.layers.mamba.ops.torch_gated_delta_relu import (
     torch_chunk_gated_delta_rule_opt,
     torch_recurrent_gated_delta_rule_opt,
@@ -385,18 +388,24 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                                    index=mamba_cache_prefill_indices,
                                    source=prefill_conv_state)
 
-            mixed_qkv_with_pad = F.pad(mixed_qkv,
-                                       (0, 0, self.conv_kernel_size - 1, 0))
-            for idx in range(self.conv_kernel_size):
-                qkv_slice = mixed_qkv_with_pad[:, idx:(idx + seq_len), :]
-                conv1d_weight_slice = self.conv1d_weight[idx]
-                qkv_conv = qkv_slice * conv1d_weight_slice
-                if idx == 0:
-                    mixed_qkv_non_spec = qkv_conv
-                else:
-                    mixed_qkv_non_spec.add_(qkv_conv)
+            if HAS_TRITON and mixed_qkv.is_cuda:
+                mixed_qkv_non_spec = causal_conv1d_triton(
+                    mixed_qkv, self.conv1d_weight, apply_silu=True)
+            else:
+                mixed_qkv_with_pad = F.pad(
+                    mixed_qkv,
+                    (0, 0, self.conv_kernel_size - 1, 0))
+                for idx in range(self.conv_kernel_size):
+                    qkv_slice = mixed_qkv_with_pad[:,
+                                                    idx:(idx + seq_len), :]
+                    conv1d_weight_slice = self.conv1d_weight[idx]
+                    qkv_conv = qkv_slice * conv1d_weight_slice
+                    if idx == 0:
+                        mixed_qkv_non_spec = qkv_conv
+                    else:
+                        mixed_qkv_non_spec.add_(qkv_conv)
 
-            mixed_qkv_non_spec = F.silu(mixed_qkv_non_spec)
+                mixed_qkv_non_spec = F.silu(mixed_qkv_non_spec)
 
         else:
             mixed_qkv_non_spec, cur_conv_state = causal_conv1d_update(
