@@ -33,21 +33,25 @@ def _run_and_compare(
     dim: int,
     conv_kernel_size: int,
     apply_silu: bool,
-    dtype: torch.dtype,
+    dtype: torch.dtype = torch.float32,
 ):
     """Run both Triton and reference, then compare outputs."""
     torch.manual_seed(42)
     x = torch.randn(batch, seq_len, dim, device=DEVICE, dtype=dtype)
-    weight = torch.randn(conv_kernel_size, dim, device=DEVICE,
-                          dtype=torch.float32)
+    weight = torch.randn(conv_kernel_size, dim, device=DEVICE, dtype=dtype)
 
-    # Reference: operate in float32 for accuracy
-    out_ref = causal_conv1d_torch_ref(x.float(), weight, apply_silu=apply_silu)
+    # Reference (same dtype)
+    out_ref = causal_conv1d_torch_ref(x, weight, apply_silu=apply_silu)
 
     # Triton kernel
-    out_tri = causal_conv1d_triton(x.float(), weight, apply_silu=apply_silu)
+    out_tri = causal_conv1d_triton(x, weight, apply_silu=apply_silu)
 
-    rtol, atol = 1e-4, 1e-4
+    if dtype == torch.bfloat16:
+        rtol, atol = 1e-2, 5e-2
+    elif dtype == torch.float16:
+        rtol, atol = 1e-3, 1e-3
+    else:
+        rtol, atol = 1e-4, 1e-4
     torch.testing.assert_close(out_tri, out_ref, rtol=rtol, atol=atol)
 
     return out_tri, out_ref
@@ -85,16 +89,8 @@ def test_silu_toggle(apply_silu):
                                     torch.bfloat16])
 def test_dtypes(dtype):
     """Test that the kernel works with different dtypes."""
-    torch.manual_seed(42)
-    batch, seq_len, dim, kernel = 2, 32, 64, 4
-    x = torch.randn(batch, seq_len, dim, device=DEVICE, dtype=dtype)
-    weight = torch.randn(kernel, dim, device=DEVICE, dtype=torch.float32)
-
-    out_ref = causal_conv1d_torch_ref(x.float(), weight, apply_silu=True)
-    out_tri = causal_conv1d_triton(x.float(), weight, apply_silu=True)
-
-    rtol, atol = 1e-4, 1e-4
-    torch.testing.assert_close(out_tri, out_ref, rtol=rtol, atol=atol)
+    _run_and_compare(batch=2, seq_len=32, dim=64, conv_kernel_size=4,
+                     apply_silu=True, dtype=dtype)
 
 
 # ---- causal property tests -------------------------------------------------
